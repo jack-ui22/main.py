@@ -1,16 +1,16 @@
 import math
+import string
+import time
+import random
+import pickle
+import gzip
 import os
-import re
+from collections import defaultdict
+import json
 import pandas as pd
+import re
 from tqdm import tqdm
 import nltk
-import string
-from collections import defaultdict
-import time
-import json
-import base64
-import struct
-import random
 #--------------文件提取-----------------
 class xml_analyse:
     def __init__(self, xml_path='data/All_Unpack'):
@@ -305,30 +305,26 @@ class create_token:
 
 # #----------------------跳表指针------------------------------
 class skip_pointer:
-    def __init__(self, inverted_list='inverted_list.json'):
-        self.inverted_list = inverted_list
-        self.line_number = 0
-        self.df=None
-        # 在初始化时就生成跳表
-        self.read_inverted_list()
-        self.create_skip_pointers()
-
-    def read_inverted_list(self):
-        # 直接读取JSON文件并转换为字典
-        with open(self.inverted_list, 'r', encoding='utf-8') as f:
-            self.inverted_index = json.load(f)
+    def __init__(self, inverted_list):
+        # 直接使用参数传递的倒排表数据，格式为{token: {file_name: [positions]}}
+        self.inverted_index = inverted_list
+        # 计算token数量
+        self.line_number = len(self.inverted_index.keys())
+        self.df = None
         # 提取所有token并排序，用于二分查找
         self.tokens = sorted(self.inverted_index.keys())
-        self.line_number = len(self.tokens)
-        return self.line_number, self.inverted_index
+        # 在初始化时就生成跳表
+        self.create_skip_pointers()
     
     def create_skip_pointers(self):
         # 一次性创建并缓存两级跳表
         self.one_skip_list = self.create_one_skip_pointer()
         self.two_skip_list = self.create_two_skip_pointer()
+    
     def create_one_skip_pointer(self):
         if not hasattr(self, 'tokens'):
-            self.read_inverted_list()
+            print('倒排表未加载')
+            return
         # 一级指针
         skip_list={}
         block_size = max(1, int(math.sqrt(self.line_number)))
@@ -341,38 +337,32 @@ class skip_pointer:
             skip_list[start] = {
                 'type': 'level1',
                 'end': end,
-                'level2': None  # 存储二级指针
+                #'level2': None  # 存储二级指针
             }
         return skip_list
+    
     def create_two_skip_pointer(self):
-        '''二级指针 - 简化优化版本'''
+        '''二级指针'''
         if not hasattr(self, 'tokens'):
-            self.read_inverted_list()
+            print('倒排表未加载')
+            return
         
         # 优化二级指针结构，使用更高效的存储方式
         skip_list = {}
-        
         # 一级块大小 - 适当调大以减少块数
         level1_block_size = max(1, int(math.sqrt(self.line_number)))
         # 二级块大小 - 基于一级块大小
         level2_block_size = max(1, int(math.sqrt(level1_block_size)))
-        
-        # 创建简化的双层跳表结构
-        # 1. 直接存储每个位置可能的跳跃目标，而不是复杂的嵌套结构
-        # 2. 预计算每个位置的最佳跳跃位置
-        
-        # 首先创建一级指针
+
         for i in range(0, self.line_number, level1_block_size):
             end = min(i + level1_block_size - 1, self.line_number - 1)
             skip_list[i] = {'end': end}
-        
-        # 然后为每个位置添加最近的二级指针
-        # 为了提高效率，我们只存储直接的跳跃目标，而不是复杂的结构
-        # 预先计算每个位置的最佳跳跃位置
         return skip_list
     
     def select_text(self, text, is_one_skip):
-        '''使用跳表指针，从倒排表获得单个token的结果 - 优化版本'''
+        '''使用跳表指针，从倒排表获得单个token的结果'''
+        # 选择使用的跳表
+        skip_list = self.one_skip_list if is_one_skip else self.two_skip_list
         # 先检查token是否存在
         if text not in self.inverted_index:
             return []
@@ -380,39 +370,31 @@ class skip_pointer:
         # 根据是否使用单层指针选择不同的搜索策略
         if is_one_skip:
             # 单层指针搜索
-            # 直接遍历跳表块进行快速定位
-            left, right = 0, len(self.tokens) - 1
-            if hasattr(self, 'one_skip_list'):
-                current = 0
-                # 使用一级指针进行快速定位
-                while current < len(self.tokens) and current in self.one_skip_list:
-                    block_end = self.one_skip_list[current]['end']
+            current = 0
+            while current < len(self.tokens):
+                if current in skip_list:
+                    block_end = skip_list[current]['end']
                     if self.tokens[block_end] < text:
                         current = block_end + 1
-                    else:
-                        # 找到可能包含目标的块
-                        left = current
-                        right = block_end
-                        break
-            
-            # 在定位的块内进行顺序查找（保持单层指针的特性）
-            for i in range(left, right + 1):
-                if self.tokens[i] == text:
-                    # 找到目标token，返回结果
-                    file_names = self.inverted_index[text]
-                    if isinstance(file_names, list):
-                        return [{'token': text, 'file_name': fname} for fname in file_names]
-                    elif isinstance(file_names, str):
-                        return [{'token': text, 'file_name': fname} for fname in file_names.split(',')]
-                    elif isinstance(file_names, dict):
-                        return [{'token': text, 'file_name': fname} for fname in file_names.keys()]
-                elif self.tokens[i] > text:
-                    break  # 因为是排序数组，后面的元素更大，提前退出
+                        continue
+                    # 在当前块内顺序查找
+                    for i in range(current, block_end + 1):
+                        if self.tokens[i] == text:
+                            return self._format_results(text)
+                        elif self.tokens[i] > text:
+                            return []
+                    return []
+                # 如果当前位置不在跳表中，顺序查找
+                if self.tokens[current] == text:
+                    return self._format_results(text)
+                elif self.tokens[current] > text:
+                    return []
+                current += 1
         else:
             # 双层指针搜索 - 使用优化的二分查找结合跳表
             left, right = 0, len(self.tokens) - 1
             
-            # 使用一级块进行粗定位
+            # 使用二级跳表进行粗定位
             if hasattr(self, 'two_skip_list'):
                 current = 0
                 while current < len(self.tokens) and current in self.two_skip_list:
@@ -420,7 +402,6 @@ class skip_pointer:
                     if self.tokens[block_end] < text:
                         current = block_end + 1
                     else:
-                        # 找到可能包含目标的块，缩小搜索范围
                         left = current
                         right = block_end
                         break
@@ -429,14 +410,7 @@ class skip_pointer:
             while left <= right:
                 mid = (left + right) // 2
                 if self.tokens[mid] == text:
-                    # 找到目标token，返回结果
-                    file_names = self.inverted_index[text]
-                    if isinstance(file_names, list):
-                        return [{'token': text, 'file_name': fname} for fname in file_names]
-                    elif isinstance(file_names, str):
-                        return [{'token': text, 'file_name': fname} for fname in file_names.split(',')]
-                    elif isinstance(file_names, dict):
-                        return [{'token': text, 'file_name': fname} for fname in file_names.keys()]
+                    return self._format_results(text)
                 elif self.tokens[mid] < text:
                     left = mid + 1
                 else:
@@ -444,137 +418,118 @@ class skip_pointer:
         
         return []
 
-    def select_texts(self, texts, is_one_skip):
-        '''result为二维列表，该函数返回多个列表，返回包含最接近的结果，
-        如有三个分词，如没有同时拥有的，那么返回包含两个结果，以此类推'''
+    def _format_results(self, text):
+        '''格式化查询结果为统一格式，包含位置信息'''
+        file_names = self.inverted_index[text]
+        if isinstance(file_names, list):
+
+            return [{'token': text, 'file_name': fname, 'positions': []} for fname in file_names]
+        elif isinstance(file_names, str):
+
+            return [{'token': text, 'file_name': fname, 'positions': []} for fname in file_names.split(',')]
+        elif isinstance(file_names, dict):
+            return [{'token': text, 'file_name': fname, 'positions': sorted(positions)} 
+                    for fname, positions in file_names.items()]
+        return []
+
+    def select_texts(self, texts, is_one_skip=True):
+        '''短语检索函数，根据select_text返回的位置信息判断是否构成短语
+        
+        Args:
+            texts: 短语分词列表，如['hello', 'world']
+            is_one_skip: 是否使用单层跳表
+            
+        Returns:
+            (包含短语的文件列表, 搜索时间)
+            文件列表格式为[{'file_name': 文件名, 'phrase_positions': [(起始位置, 结束位置)]}]
+        '''
         start_time = time.time()
-        # 优化：先过滤空文本
-        valid_texts = [text for text in texts if text.strip()]
+        clean=create_token()
+        stopwords = clean.read_stopwords()
+        tokens = nltk.word_tokenize(texts)
+        valid_texts = clean.clean_token(tokens=tokens, stopwords=stopwords)
+        print('分词结果：',valid_texts)
         if not valid_texts:
             print('没有有效的搜索文本')
             return [], time.time() - start_time
         
-        results = []
+        # 对于单个词项，直接返回select_text的结果
+        if len(valid_texts) == 1:
+            result = self.select_text(valid_texts[0], is_one_skip)
+            # 转换为要求的格式
+            phrase_results = []
+            for item in result:
+                phrase_positions = []
+                # 如果有位置信息，每个位置都作为一个短语位置
+                for pos in item['positions']:
+                    phrase_positions.append((pos, pos))  # (start, end)格式
+                phrase_results.append({
+                    'file_name': item['file_name'],
+                    'phrase_positions': phrase_positions
+                })
+            return phrase_results, time.time() - start_time
+        
+        # 获取每个词项的查询结果（包含位置信息）
+        term_results = {}
         for text in valid_texts:
             result = self.select_text(text, is_one_skip)
-            results.append(result)
+            # 转换为 {file_name: positions} 的格式
+            file_positions = {}
+            for item in result:
+                file_positions[item['file_name']] = item['positions']
+            term_results[text] = file_positions
         
-        # 统计每个文件出现的次数
-        file_count = defaultdict(int)
-        for i in range(len(results)):  # 移除tqdm以减少开销，除非处理大量数据
-            # 使用集合去重，避免同一分词结果中重复计数
-            unique_files = set()
-            for item in results[i]:
-                unique_files.add(item['file_name'])
-            # 更新文件计数
-            for file_name in unique_files:
-                file_count[file_name] += 1
+        # 找出所有文件的交集
+        common_files = set(term_results[valid_texts[0]].keys())
+        for text in valid_texts[1:]:
+            common_files.intersection_update(term_results[text].keys())
         
-        # 按共同出现次数分组文件
-        count_groups = defaultdict(list)
-        for file_name, count in file_count.items():
-            count_groups[count].append(file_name)
+        if not common_files:
+            print('没有找到包含所有词项的文件')
+            return [], time.time() - start_time
         
-        # 从高到低排序
-        sorted_counts = sorted(count_groups.keys(), reverse=True)
-        
-        # 添加空列表检查
-        if not sorted_counts:  # 检查列表是否为空
-            print('没有找到匹配的文件')
-            end_time = time.time()
-            times = end_time - start_time
-            return [], times
-        
-        max_count = sorted_counts[0]
-        print('出现次数:', max_count)
-        # 优化：按相关性排序结果
-        final_results = []
-        for count in sorted_counts:
-            # 只返回与最高频率相差不超过1的结果
-            if max_count - count <= 1:
-                final_results.append(sorted(count_groups[count]))
-            else:
-                break
+        # 对于每个共同文件，检查词项是否按顺序连续出现（构成短语）
+        phrase_matches = []
+        for file_name in common_files:
+            # 获取第一个词项的所有位置
+            first_token_positions = term_results[valid_texts[0]][file_name]
+            phrase_positions = []
+            
+            # 检查每个可能的起始位置
+            for start_pos in first_token_positions:
+                is_phrase = True
+                current_pos = start_pos
+                
+                # 检查后续词项是否在正确的位置
+                for i in range(1, len(valid_texts)):
+                    next_token = valid_texts[i]
+                    next_token_positions = term_results[next_token][file_name]
+                    
+                    # 后续词项应该出现在前一个词项的下一个位置
+                    expected_pos = current_pos + 1
+                    
+                    # 检查expected_pos是否在next_token的位置列表中
+                    if expected_pos not in next_token_positions:
+                        is_phrase = False
+                        break
+                    
+                    current_pos = expected_pos
+                
+                # 如果是有效的短语，记录起始和结束位置
+                if is_phrase:
+                    phrase_positions.append((start_pos, current_pos))
+            
+            if phrase_positions:
+                phrase_matches.append({
+                    'file_name': file_name,
+                    'phrase_positions': phrase_positions
+                })
         
         end_time = time.time()
         times = end_time - start_time
-        return final_results, times
-    def select_text(self, text, is_one_skip):
-        '''使用跳表指针，从倒排表获得单个token的结果'''
-        # 选择使用的跳表
-        skip_list = self.one_skip_list if is_one_skip else self.two_skip_list
-        
-        # 先检查token是否存在
-        if text not in self.inverted_index:
-            return []
-        
-        current = 0
-        results = []
-        
-        # 使用跳表进行查找
-        while current < len(self.tokens):
-            current_token = self.tokens[current]
-            
-            # 找到目标token
-            if current_token == text:
-                file_names = self.inverted_index[current_token]
-                # 处理不同格式的file_names
-                if isinstance(file_names, list):
-                    results = [{'token': text, 'file_name': fname} for fname in file_names]
-                elif isinstance(file_names, str):
-                    results = [{'token': text, 'file_name': fname} for fname in file_names.split(',')]
-                elif isinstance(file_names, dict):
-                    results = [{'token': text, 'file_name': fname} for fname in file_names.keys()]
-                break
-            
-            # 如果当前token已经大于目标text，说明目标不存在
-            if current_token > text:
-                break
-            
-            # 跳表指针处理 - 优化版本
-            if current in skip_list:
-                skip_info = skip_list[current]
-                
-                # 首先尝试使用二级指针（如果存在）
-                if not is_one_skip and 'level2' in skip_info and skip_info['level2']:
-                    # 找到当前位置之后最近的二级指针起始位置
-                    # 这里不再排序，直接使用字典的特性
-                    best_jump = current
-                    # 快速检查：如果当前块的末尾都小于目标，则直接跳到块末尾
-                    if skip_info['end'] < len(self.tokens) and self.tokens[skip_info['end']] <= text:
-                        current = skip_info['end']
-                        continue
-                    
-                    # 只检查最接近当前位置的几个二级指针
-                    # 获取所有起始位置大于current的二级指针
-                    level2_positions = [pos for pos in skip_info['level2'].keys() if pos > current]
-                    if level2_positions:
-                        # 找到第一个超过text的位置
-                        for pos in sorted(level2_positions):
-                            end_pos = skip_info['level2'][pos]
-                            if end_pos < len(self.tokens) and self.tokens[end_pos] <= text:
-                                best_jump = end_pos
-                            else:
-                                break
-                        if best_jump > current:
-                            current = best_jump
-                            continue
-                
-                # 使用一级指针
-                if 'end' in skip_info:
-                    skip_end = skip_info['end']
-                    # 确保索引有效
-                    if skip_end < len(self.tokens) and self.tokens[skip_end] <= text:
-                        current = skip_end
-                        continue
-            
-            # 如果没有可以跳的指针，就顺序查找
-            current += 1
-        
-        return results
-
+        return phrase_matches, times
+    
     def input_participle(self, num_tokens=10):
-        # 从倒排索引的tokens中随机选择指定数量的token（增加查询数量）
 
         # 确保不会选择过多token
         num_tokens = min(num_tokens, len(self.tokens))
@@ -586,7 +541,7 @@ class skip_pointer:
             print(f'{i}. {text}')
         
         print('\n单层指针测试：')
-        # 单层指针测试 - 单次查询（不重复）
+        # 单层指针测试
         start_time = time.time()
         all_results1 = []
         for text in texts:
@@ -615,7 +570,7 @@ class skip_pointer:
         
         print('\n' + '-'*50 + '\n')
         print('双层指针测试：')
-        # 双层指针测试 - 单次查询（不重复）
+        # 双层指针测试
         start_time2 = time.time()
         all_results2 = []
         for text in texts:
@@ -623,11 +578,9 @@ class skip_pointer:
             all_results2.append(result)
         total_time2 = time.time() - start_time2
         avg_time2 = total_time2 / num_tokens
-        
         # 输出双层指针的时间信息
         print(f'总查询时间：{total_time2:.6f}秒')
         print(f'平均每个查询时间：{avg_time2:.6f}秒')
-        
         # 输出性能比较
         if total_time1 > total_time2:
             speedup = total_time1 / total_time2
@@ -637,10 +590,10 @@ class skip_pointer:
             print(f'\n单层指针比双层指针快 {slowdown:.2f} 倍')
 
 # 运行单次随机查询测试
-print("跳表索引查询性能测试")
-print("=" * 50)
-skip_pointer = skip_pointer()
-skip_pointer.input_participle(num_tokens=300)  # 增加到15个随机查询token
+# print("跳表索引查询性能测试")
+# print("=" * 50)
+# skip_pointer = skip_pointer()
+# skip_pointer.input_participle(num_tokens=300)
 
 #---------------------倒排表压缩与优化---——————————————————————————————
 class optimize_inverted(create_token):
@@ -649,6 +602,7 @@ class optimize_inverted(create_token):
 
     def inverted_list(self):
         """
+        倒排表格式
         {token: {file_name: [positions]}}
         """
         try:
@@ -692,82 +646,288 @@ class optimize_inverted(create_token):
         except Exception as e:
             print(f"error in read json:{e}")
             return {}
-
-    def write_to_json(self, inverted_index, output_file):
+    
+    def front_coding(self, tokens):
+        """
+        对排序后的词项列表进行前端编码压缩
+        """
+        if not tokens:
+            return []
+        
+        encoded_dict = []
+        i = 0
+        block_size = 8  # 更大的块大小以提高压缩率
+        
+        while i < len(tokens):
+            # 取当前块的第一个词作为前缀
+            prefix = tokens[i]
+            # 第一个词特殊标记为-1表示完整词项
+            encoded_dict.append((-1, prefix))
+            
+            # 处理当前块的后续词项
+            j = 1
+            while i + j < len(tokens) and j < block_size:
+                current_token = tokens[i + j]
+                # 计算公共前缀长度
+                common_len = 0
+                min_len = min(len(prefix), len(current_token))
+                while common_len < min_len and prefix[common_len] == current_token[common_len]:
+                    common_len += 1
+                # 存储公共长度和后缀
+                suffix = current_token[common_len:]
+                encoded_dict.append((common_len, suffix))
+                j += 1
+            
+            i += j
+        
+        return encoded_dict
+    
+    def front_decoding(self, encoded_dict):
+        """
+        对前端编码的词典进行解码
+        """
+        tokens = []
+        prefix = None
+        
+        for item in encoded_dict:
+            common_len, data = item
+            if common_len == -1:
+                # -1表示完整词项，作为新块的前缀
+                prefix = data
+                tokens.append(prefix)
+            else:
+                # 根据公共前缀长度和后缀重建词项
+                if prefix is not None:
+                    full_token = prefix[:common_len] + data
+                    tokens.append(full_token)
+        
+        return tokens
+    
+    def delta_encoding(self, positions):
+        """
+        对位置列表进行差值编码
+        """
+        if not positions:
+            return []
+        
+        encoded = [positions[0]]  # 第一个元素保持不变
+        for i in range(1, len(positions)):
+            encoded.append(positions[i] - positions[i-1])  # 存储差值
+        
+        return encoded
+    
+    def delta_decoding(self, encoded_positions):
+        """
+        对差值编码的位置列表进行解码
+        """
+        if not encoded_positions:
+            return []
+        
+        decoded = [encoded_positions[0]]  # 第一个元素保持不变
+        for i in range(1, len(encoded_positions)):
+            decoded.append(decoded[i-1] + encoded_positions[i])  # 累加差值得到原始位置
+        
+        return decoded
+    
+    def save_separate_structures(self, inverted_index):
+        """
+        分离存储词典和倒排表
+        - 词典使用前端编码保存为txt文件
+        - 倒排表使用差值编码保存为CSV文件
+        - 同时保存压缩前后的词典和倒排表用于比较
+        返回:
+        - 是否保存成功
+        """
         try:
-            # 准备JSON数据结构
-            json_data = {}
-            for token, file_positions in inverted_index.items():
-                # 直接使用位置列表（整数列表）作为值
-                json_data[token] = {
-                    file_name: positions  # 保持位置为整数列表
-                    for file_name, positions in file_positions.items()
-                }
-
-            # 写入JSON文件
-            with open(output_file, 'w', encoding='utf-8') as jsonfile:
-                json.dump(
-                    json_data,
-                    jsonfile,
-                    ensure_ascii=False,
-                    indent=4,  # 使用缩进格式化，提高可读性
-                    sort_keys=True  # 按键名（token）排序
-                )
-            print(f"优化后的倒排索引已成功写入: {output_file}")
+            # 使用汉语命名的文件
+            dict_file = "词典_前端编码.txt"  # 压缩后的词典
+            original_dict_file = "词典_原始.txt"  # 原始词典
+            postings_file = "倒排表_差值编码.csv"  # 压缩后的倒排表
+            original_postings_file = "倒排表_原始.csv"  # 原始倒排表
+            
+            # 1. 处理词典 - 提取并排序所有词项
+            sorted_tokens = sorted(inverted_index.keys())
+            
+            # 保存原始词典
+            with open(original_dict_file, 'w', encoding='utf-8') as f:
+                for token in sorted_tokens:
+                    f.write(f"{token}\n")
+            
+            # 前端编码压缩词典
+            encoded_dict = self.front_coding(sorted_tokens)
+            
+            # 保存压缩后的词典（简化格式）
+            with open(dict_file, 'w', encoding='utf-8') as f:
+                for common_len, data in encoded_dict:
+                    # -1表示完整词项，其他值表示公共前缀长度
+                    f.write(f"{common_len}:{data}\n")
+            
+            # 2. 处理倒排表 - 保存原始倒排表
+            with open(original_postings_file, 'w', encoding='utf-8') as f:
+                f.write("token,file_name,positions\n")
+                for token, file_positions in inverted_index.items():
+                    for file_name, positions in file_positions.items():
+                        positions_str = ','.join(map(str, positions))
+                        f.write(f"{token},{file_name},{positions_str}\n")
+            
+            # 3. 使用差值编码保存倒排表
+            with open(postings_file, 'w', encoding='utf-8') as f:
+                # 写入表头
+                f.write("token_id,file_name,encoded_positions\n")
+                
+                for token_id, token in enumerate(sorted_tokens):
+                    # 使用token_id作为指针，不存储token本身
+                    for file_name, positions in inverted_index[token].items():
+                        # 差值编码位置列表
+                        encoded_positions = self.delta_encoding(positions)
+                        # 将编码后的位置转换为字符串
+                        positions_str = ','.join(map(str, encoded_positions))
+                        f.write(f"{token_id},{file_name},{positions_str}\n")
+            
+            # 计算压缩率
+            dict_size = os.path.getsize(dict_file)
+            original_dict_size = os.path.getsize(original_dict_file)
+            postings_size = os.path.getsize(postings_file)
+            original_postings_size = os.path.getsize(original_postings_file)
+            
+            # 计算词典压缩率
+            dict_compression_ratio = (1 - dict_size / original_dict_size) * 100 if original_dict_size > 0 else 0
+            # 计算倒排表压缩率
+            postings_compression_ratio = (1 - postings_size / original_postings_size) * 100 if original_postings_size > 0 else 0
+            # 计算总体压缩率
+            original_total_size = original_dict_size + original_postings_size
+            compressed_total_size = dict_size + postings_size
+            total_compression_ratio = (1 - compressed_total_size / original_total_size) * 100 if original_total_size > 0 else 0
+            
+            print("\n--- 词典压缩结果 ---")
+            print(f"原始词典文件已保存: {original_dict_file} ({original_dict_size / 1024:.2f} KB)")
+            print(f"压缩后词典文件已保存: {dict_file} ({dict_size / 1024:.2f} KB)")
+            print(f"词典压缩率: {dict_compression_ratio:.2f}%")
+            print("\n--- 倒排表压缩结果 ---")
+            print(f"原始倒排表文件已保存: {original_postings_file} ({original_postings_size / 1024:.2f} KB)")
+            print(f"压缩后倒排表文件已保存: {postings_file} ({postings_size / 1024:.2f} KB)")
+            print(f"倒排表压缩率: {postings_compression_ratio:.2f}%")
+            print(f"总压缩率: {total_compression_ratio:.2f}%")
+            
             return True
-
         except Exception as e:
-            print(f"写入JSON时出错: {e}")
+            print(f"保存分离结构时出错: {e}")
             return False
-
-    def compress_list(self, inverted_index):
+    
+    def load_separate_structures(self):
         """
-        该方法通过将位置列表转换为字节格式，并进行Base64编码，来压缩倒排索引。
+        从分离的文件中加载词典和倒排表，重建完整的倒排索引
+        确保返回格式严格为{token: {file_name: [positions]}}
         """
-        compressed_index = defaultdict(dict)
-        for token, file_positions in inverted_index.items():
-            for file_name, positions in file_positions.items():
-                # 使用 struct 将位置列表转换为字节格式
-                # 通过 struct.pack() 将整数列表转换为字节串
-                byte_positions = struct.pack(f'{len(positions)}i', *positions)
+        try:
+            dict_file = "词典_前端编码.txt"
+            postings_file = "倒排表_差值编码.csv"
+            encoded_dict = []
+            
+            with open(dict_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        common_len_str, data = line.split(':', 1)
+                        common_len = int(common_len_str)
+                        encoded_dict.append((common_len, data))
+                    except (ValueError, IndexError):
+                        continue
+            sorted_tokens = self.front_decoding(encoded_dict)
+            inverted_index = {}  # {token: {file_name: [positions]}}
+            
+            with open(postings_file, 'r', encoding='utf-8') as f:
+                header = next(f)  # 跳过表头
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    parts = line.split(',', 2)
+                    if len(parts) != 3:
+                        continue
+                    
+                    token_id = int(parts[0])
+                    file_name = parts[1]
+                    positions_str = parts[2]
 
-                # 使用 Base64 对字节串进行编码
-                encoded_positions = base64.b64encode(byte_positions).decode('utf-8')
-                compressed_index[token][file_name] = encoded_positions
+                    # 验证token_id的有效性
+                    if token_id < 0 or token_id >= len(sorted_tokens):
+                        print(f"无效的token_id: {token_id}")
+                        continue
+                    token = sorted_tokens[token_id]
 
-        return dict(compressed_index)
-
-    def block_storage(self, inverted_index, block_size=1000, output_dir='blocks'):
-        os.makedirs(output_dir, exist_ok=True)
-        blocks = defaultdict(dict)
-        current_block = 0
-        current_size = 0
-
-        for token, file_positions in inverted_index.items():
-            for file_name, positions in file_positions.items():
-                if current_size >= block_size:
-                    with open(f"{output_dir}/block_{current_block}.json", 'w', encoding='utf-8') as jsonfile:
-                        json.dump(blocks, jsonfile, ensure_ascii=False, indent=4, sort_keys=True)
-                    current_block += 1
-                    blocks = defaultdict(dict)
-                    current_size = 0
-
-                blocks[token][file_name] = positions
-                current_size += 1
-        if blocks:
-            with open(f"{output_dir}/block_{current_block}.json", 'w', encoding='utf-8') as jsonfile:
-                json.dump(blocks, jsonfile, ensure_ascii=False, indent=4, sort_keys=True)
-
-        print(f"倒排索引已成功按块存储到: {output_dir}")
+                    # 确保位置列表正确解码
+                    try:
+                        encoded_positions = list(map(int, positions_str.split(',')))
+                        positions = self.delta_decoding(encoded_positions)
+                        
+                        # 确保返回格式严格为{token: {file_name: [positions]}}
+                        if token not in inverted_index:
+                            inverted_index[token] = {}
+                        inverted_index[token][file_name] = positions
+                    except Exception as e:
+                        print(f"处理位置数据时出错: {e}")
+                        continue
+            
+            print(f"成功加载倒排索引: {len(inverted_index)} 个词项")
+            return inverted_index
+        except FileNotFoundError as e:
+            print(f"文件未找到: {e}")
+            return None
+        except Exception as e:
+            print(f"加载分离结构时出错: {e}")
+            return None
+    
+    def is_ture(self, original_index, loaded_index):
+        """
+        验证原始倒排索引和加载后的倒排索引是否完全一致
+        """
+        new_inversted=loaded_index
+        old_inverted = original_index
+        if new_inversted != old_inverted:
+            print("出错")
+            return False
+        print("---读取倒排表-----")
+        # 对于字典类型，使用items()方法获取前10个键值对
+        print(list(new_inversted.items())[:3])
+        print("-----原倒排表-----")
+        print(list(old_inverted.items())[:3])
         return True
+# 测试代码
+if __name__ == "__main__":
+    # 创建优化器实例
+    optimizer = optimize_inverted()
+    
+    # 生成倒排索引
+    print("正在生成倒排索引...")
+    inverted_index = optimizer.inverted_list()
+    print(f"倒排索引生成完成，包含 {len(inverted_index)} 个词项")
+    
+    # 保存分离的结构
+    print("\n正在保存分离的词典和倒排表...")
+    optimizer.save_separate_structures(inverted_index)
+    
+    # 测试加载分离存储的数据
+    print("\n正在从分离文件加载倒排索引...")
+    loaded_index = optimizer.load_separate_structures()
+    
+    # 使用is_ture验证函数验证一致性
+    if loaded_index:
+        print("\n正在验证索引一致性...")
+        is_consistent = optimizer.is_ture(inverted_index, loaded_index)
+        print(f"一致性验证结果: {'通过' if is_consistent else '失败'}")
+    skip=skip_pointer(inverted_list=loaded_index)
+    one=skip.select_text(text="recipe",is_one_skip=True)
+    skip2=skip_pointer(inverted_list=inverted_index)
+    two=skip2.select_text(text="recipe",is_one_skip=True)
+    if one==two:
+        print("完全相同")
+    else :
+        print("不一样")
 
 
-# token = optimize_inverted()
-# inverted_index = token.inverted_list()
-#
-# token.write_to_json(inverted_index, 'inverted_list.json')
-#
-# compressed_index = token.compress_list(inverted_index)
-# token.write_to_json(compressed_index, 'compressed.json')
-#
-# token.block_storage(inverted_index, block_size=500, output_dir='inverted_blocks')
+            
+
